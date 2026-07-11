@@ -1,0 +1,1019 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Update.h> 
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ==========================================
+// HARDWARE CONFIGURATION & PIN ASSIGNMENTS
+// ==========================================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+const int START_BUTTON_PIN = 4;   // TTP223 Touch Interface
+const int LASER_SENSOR_PIN = 13;  // Active Laser Receiver Module
+const int RED_LED_PIN = 18;       // Status LED Red
+const int GREEN_LED_PIN = 19;     // Status LED Green
+const int BUZZER_PIN = 26;        // Standard Piezo Buzzer
+const int BATTERY_ADC_PIN = 34;   // Battery Voltage Divider Input
+
+const int LASER_ALIGNED_STATE = LOW; 
+
+// ==========================================
+// SYSTEM DEADBANDS & TIMING MATRICES
+// ==========================================
+const unsigned long PASS_LOCKOUT_MICROS = 800000;       // 800ms protection against secondary shadows
+const unsigned long SPECIAL_DEADZONE_MICROS = 1000000;   // 1-second ignition stabilization window
+const unsigned long INACTIVITY_TIMEOUT_MILLIS = 600000; // 10 minutes auto deep sleep
+unsigned long lastSystemActivityMillis = 0;
+
+// ==========================================
+// LOCAL ACCESS POINT ENVIRONMENT CREDENTIALS
+// ==========================================
+const char* ssid = "SprintTimer";
+const char* password = ""; 
+
+WebServer server(80);
+
+// ==========================================
+// STATE MACHINE DATA PROFILES
+// ==========================================
+enum SystemMode { MODE_MAIN, MODE_SPECIAL };
+volatile SystemMode activeMode = MODE_MAIN;
+
+enum SystemState { IDLE, ARM_WAIT_START, RUNNING, FINISHED, DISPLAY_SCORE, INFO_SCREEN, OTA_UPDATE };
+volatile SystemState currentState = IDLE;
+
+volatile unsigned long startTimeMicros = 0;
+volatile unsigned long lastPassMicros = 0;
+unsigned long menuRefreshTimerMillis = 0;
+unsigned long ledBlinkTimerMillis = 0;
+float finalTimeSeconds = 0.0;
+
+volatile int currentLapSequenceNumber = 0;
+volatile unsigned long runIdCounter = 0; 
+bool isWifiActive = false; 
+
+volatile bool laserWasAlignedSinceArming = false;
+
+// ==========================================
+// DIRECT LOW-LEVEL HARDWARE CONTROLS
+// ==========================================
+bool isLaserAligned() {
+    return (digitalRead(LASER_SENSOR_PIN) == LASER_ALIGNED_STATE);
+}
+
+void triggerSimpleBeep(int frequency, int durationMs) {
+    tone(BUZZER_PIN, frequency, durationMs);
+    delay(durationMs);
+    noTone(BUZZER_PIN);
+}
+
+int getBatteryPercentage() {
+    long sum = 0;
+    for(int i = 0; i < 10; i++) {
+        sum += analogRead(BATTERY_ADC_PIN);
+        delayMicroseconds(50);
+    }
+    float avgRaw = sum / 10.0;
+    float calculatedVoltage = (avgRaw / 4095.0) * 3.3 * 2.0; 
+    int capacityPercent = (int)((calculatedVoltage - 3.4) / (4.2 - 3.4) * 100.0);
+    return constrain(capacityPercent, 0, 100);
+}
+
+void turnWifiOn() {
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP(ssid, password);
+    server.begin();
+    isWifiActive = true;
+}
+
+void turnWifiOff() {
+    server.stop();
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    isWifiActive = false;
+}
+
+// ==========================================
+// OLED GRAPHICS DRAW ROUTINES
+// ==========================================
+void drawBatteryOverlay() {
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(100, 4);
+    display.print(getBatteryPercentage());
+    display.print("%");
+}
+
+void showStandbyScreen() {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(4, 4);
+    display.println(activeMode == MODE_MAIN ? "MODE: MAIN (LASER)" : "MODE: SPECIAL (CD)");
+    display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+    drawBatteryOverlay();
+
+    display.setCursor(8, 22);
+    if (currentState == IDLE) {
+        display.println("STATUS: UNARMED");
+        display.setCursor(8, 42);
+        display.println(activeMode == MODE_MAIN ? "Hold 2s: Arm Gate" : "Hold 2s: Start Count");
+    } else if (currentState == ARM_WAIT_START) {
+        display.println("STATUS: ARMED READY");
+        display.setCursor(8, 42);
+        display.println("Cross Gate to Start");
+    }
+    display.setCursor(8, 54);
+    display.print(isWifiActive ? "AP NET: ONLINE" : "AP NET: SLEEP MODE");
+    display.display();
+}
+
+void showLaserAlignmentWarning() {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(4, 4);
+    display.println("ALIGNMENT FAULT");
+    display.drawFastHLine(0, 15, 128, SSD1306_WHITE);
+    drawBatteryOverlay();
+    display.setCursor(16, 28);
+    display.println("LASER MISALIGNED");
+    display.setCursor(10, 44);
+    display.println("Adjust Beam Line");
+    display.display();
+}
+
+void showInfoScreen() {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(4, 4);
+    display.println("SYSTEM INVENTORY");
+    display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+    display.setCursor(4, 20);
+    if (isWifiActive) {
+        display.println("RF NET: BROADCASTING");
+        display.setCursor(4, 30);
+        display.print("SSID:   "); display.println(ssid);
+        display.setCursor(4, 40);
+        display.println("PORTAL: MAIN CONSOLE");
+    } else {
+        display.println("RF NET: POWER DOWN");
+    }
+    display.setCursor(4, 55);
+    display.print("CORE: SPRINT V8.2 SPA");
+    display.display();
+}
+
+void executeSystemSleep() {
+    display.clearDisplay();
+    display.display();
+    display.ssd1306_command(SSD1306_DISPLAYOFF); 
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    
+    bool cachedRadioState = isWifiActive;
+    if (isWifiActive) turnWifiOff();
+    
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)START_BUTTON_PIN, HIGH);
+    esp_light_sleep_start();
+    
+    display.ssd1306_command(SSD1306_DISPLAYON);
+    if (cachedRadioState) turnWifiOn();
+    
+    lastSystemActivityMillis = millis();
+    currentState = IDLE;
+    triggerSimpleBeep(2000, 150);
+    if(isLaserAligned()) showStandbyScreen(); else showLaserAlignmentWarning();
+}
+
+void startSpecialModeWithCountdown() {
+    runIdCounter++; 
+    for (int i = 3; i > 0; i--) {
+        display.clearDisplay();
+        display.setTextColor(SSD1306_WHITE);
+        display.setTextSize(1); display.setCursor(4, 4);
+        display.println("SPECIAL MODE TIMER");
+        display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+        display.setCursor(40, 30);
+        display.print("COUNT:  "); display.print(i);
+        display.display();
+        
+        tone(BUZZER_PIN, 1200, 150);
+        
+        unsigned long startCountdownBracketMillis = millis();
+        bool alternateFlashState = false;
+        while(millis() - startCountdownBracketMillis < 1000) {
+            alternateFlashState = !alternateFlashState;
+            digitalWrite(RED_LED_PIN, alternateFlashState ? HIGH : LOW);
+            digitalWrite(GREEN_LED_PIN, alternateFlashState ? LOW : HIGH);
+            delay(125); 
+        }
+    }
+    
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, HIGH); 
+    
+    display.clearDisplay();
+    display.setTextSize(1); display.setCursor(4, 4);
+    display.println("SPECIAL MODE TIMER");
+    display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+    display.setCursor(40, 30);
+    display.print("LAUNCH GO!");
+    display.display();
+    triggerSimpleBeep(2200, 400);
+    
+    startTimeMicros = micros();
+    lastPassMicros = startTimeMicros;
+    currentState = RUNNING;
+    currentLapSequenceNumber = 1;
+}
+
+// ==========================================
+// SINGLE-PAGE APPLICATION INTEGRATED UI
+// ==========================================
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Telemetry Matrix Console</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, Arial, sans-serif; background-color: #0c0c0e; color: #d1d1d6; margin: 0; padding: 10px; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .meta-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        h3 { color: #00ffcc; font-size: 15px; text-transform: uppercase; letter-spacing: 1px; margin: 0; }
+        .stat-badge { background: #1c1c1e; color: #00ffcc; padding: 4px 10px; border-radius: 12px; font-size: 11px; border: 1px solid #2c2c2e; font-weight: bold; }
+        .panel { background: #121214; padding: 12px; border-radius: 8px; border: 1px solid #1c1c1e; margin-bottom: 12px; }
+        .mode-selector { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+        .m-btn { padding: 8px; font-size: 11px; font-weight: bold; border: 1px solid #2c2c2e; border-radius: 6px; background: #1a1a1c; color: #777; cursor: pointer; text-transform: uppercase; }
+        .m-btn.active { background: #00ffcc; color: #0c0c0e; border: 1px solid #00ffcc; }
+        .action-btn { width: 100%; padding: 12px; font-size: 13px; font-weight: bold; border: none; border-radius: 20px; cursor: pointer; text-transform: uppercase; background: #00ffcc; color: #0c0c0e; }
+        .action-btn:disabled { background: #222; color: #555; cursor: not-allowed; }
+        
+        .profile-tabs { display: flex; border-bottom: 2px solid #1c1c1e; margin: 15px 0 10px 0; }
+        .tab-item { padding: 8px 16px; font-size: 11px; font-weight: bold; text-transform: uppercase; color: #666; cursor: pointer; }
+        .tab-item.active { color: #00ffcc; border-bottom: 2px solid #00ffcc; margin-bottom: -2px; }
+
+        .group-header { background: #1c1c21; padding: 8px 12px; border-radius: 6px; display: flex; justify-content: space-between; align-items: center; margin-top: 15px; border-left: 3px solid #00ffcc; }
+        .group-title { font-size: 12px; font-weight: bold; color: #fff; }
+        .session-box { background: #141416; padding: 12px; border-radius: 6px; margin: 10px 0; border: 1px solid #252528; }
+        .session-meta { display: flex; justify-content: space-between; font-size: 11px; color: #00ffcc; font-weight: bold; padding-bottom: 6px; border-bottom: 1px solid #222; }
+        .del-text { color: #ff3b30; cursor: pointer; font-size: 10px; text-transform: uppercase; font-weight: bold; background: none; border: none; padding: 0; }
+        table { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 8px; }
+        th { text-align: left; color: #666; padding: 4px 0; text-transform: uppercase; font-size: 9px; }
+        td { padding: 5px 0; border-bottom: 1px solid #1c1c1f; color: #eee; }
+        .highlight { color: #00ffcc; font-weight: bold; }
+        .svg-box { width: 100%; background: #09090b; border-radius: 4px; margin: 6px 0; border: 1px solid #1c1e1e; display: block; }
+        
+        .summary-matrix { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 5px; }
+        .metric-tile { background: #121214; padding: 8px; border-radius: 6px; border: 1px solid #1c1e1e; text-align: center; }
+        .metric-val { font-size: 16px; font-weight: bold; color: #00ffcc; }
+        .metric-lbl { font-size: 9px; color: #666; text-transform: uppercase; margin-top: 2px; }
+
+        /* Integrated Mobile OTA Module */
+        .ota-wrap { border: 1px dashed #ff9500; background: #14110f; padding: 12px; border-radius: 8px; margin-top: 20px; text-align: left; }
+        .ota-title { font-size: 11px; font-weight: bold; color: #ff9500; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; }
+        .ota-warn { font-size: 9px; color: #ff3b30; font-weight: bold; text-transform: uppercase; margin-bottom: 8px; letter-spacing: 0.3px; }
+        .file-input-hack { background: #1c1c1e; display: block; width: 100%; padding: 8px; margin-bottom: 8px; border-radius: 4px; border: 1px solid #2c2c2e; font-size: 11px; color: #aaa; box-sizing: border-box; }
+        .ota-btn { background: #ff9500; color: #000; width: 100%; padding: 8px; font-size: 11px; font-weight: bold; text-transform: uppercase; border: none; border-radius: 4px; cursor: pointer; }
+        .ota-btn:disabled { background: #222; color: #555; cursor: not-allowed; }
+        .ota-progress { display: none; margin-top: 8px; font-size: 11px; font-weight: bold; color: #00ffcc; text-align: center; background: #0f1a16; padding: 6px; border-radius: 4px; border: 1px solid #143529; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="meta-header">
+            <h3>Sprint Core Engine</h3>
+            <div id="batTag" class="stat-badge">BAT: --%</div>
+        </div>
+
+        <div class="mode-selector">
+            <button id="bMain" class="m-btn active" onclick="switchMode('main')">Main (Laser)</button>
+            <button id="bSpec" class="m-btn" onclick="switchMode('special')">Special (Countdown)</button>
+        </div>
+
+        <div class="panel">
+            <button id="mTrigger" class="action-btn" onclick="armTarget()">Arm Track Session</button>
+            <div id="sysState" style="margin-top:8px; font-size:11px; color:#ff9500; text-align:center;">Syncing Core Engine...</div>
+        </div>
+
+        <div class="profile-tabs">
+            <div id="tabMain" class="tab-item active" onclick="setViewProfile('Main')">Main Laser Logs</div>
+            <div id="tabSpec" class="tab-item" onclick="setViewProfile('Special')">Special CD Logs</div>
+        </div>
+
+        <div class="summary-matrix">
+            <div class="metric-tile"><div id="bestRecord" class="metric-val">--</div><div class="metric-lbl">Profile Record (PB)</div></div>
+            <div class="metric-tile"><div id="sessionCount" class="metric-val">0</div><div class="metric-lbl">Total Runs</div></div>
+        </div>
+        
+        <div class="panel" style="margin-top:8px; background:transparent; border:none; padding:0;">
+            <h4 style="font-size:9px; text-transform:uppercase; color:#666; margin:0 0 6px 0;">Historical Performance Profile</h4>
+            <div id="globalChartContainer" class="svg-box"></div>
+        </div>
+
+        <div id="dbRenderHook"></div>
+
+        <div class="ota-wrap" id="otaModule">
+            <div class="ota-title">Wireless Firmware Flash System</div>
+            <div class="ota-warn">⚠️ Crucial: Shut off mobile data completely before flashing!</div>
+            <input type="file" id="otaBinFile" accept=".bin" class="file-input-hack" onchange="document.getElementById('otaSubmit').disabled = false;">
+            <button id="otaSubmit" class="ota-btn" disabled onclick="executeMobileOtaUpload()">Stream Payload to Flash</button>
+            <div id="otaStatusBox" class="ota-progress">Preparing wireless interface...</div>
+        </div>
+    </div>
+
+    <script>
+        let db = []; 
+        let lastProcessedLapKey = "";
+        let currentModeRef = "main";
+        let activeViewProfile = "Main"; 
+        let systemLockedForUpdate = false;
+
+        function loadDatabase() {
+            const data = localStorage.getItem('sprint_db_v8');
+            if(data) { try { db = JSON.parse(data); } catch(e) { db = []; } }
+            renderTree();
+        }
+
+        function saveDatabase() {
+            localStorage.setItem('sprint_db_v8', JSON.stringify(db));
+            renderTree();
+        }
+
+        function getFormattedDate() {
+            const d = new Date();
+            return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,'0') + "-" + String(d.getDate()).padStart(2,'0');
+        }
+
+        function switchMode(m) {
+            if (systemLockedForUpdate) return;
+            fetch('/setMode?mode=' + m).then(() => {
+                currentModeRef = m;
+                document.getElementById('bMain').className = (m === 'main') ? 'm-btn active' : 'm-btn';
+                document.getElementById('bSpec').className = (m === 'special') ? 'm-btn active' : 'm-btn';
+                setViewProfile(m === 'main' ? 'Main' : 'Special');
+            });
+        }
+
+        function setViewProfile(p) {
+            activeViewProfile = p;
+            document.getElementById('tabMain').className = (p === 'Main') ? 'tab-item active' : 'tab-item';
+            document.getElementById('tabSpec').className = (p === 'Special') ? 'tab-item active' : 'tab-item';
+            renderTree();
+        }
+
+        function armTarget() { if (!systemLockedForUpdate) fetch('/arm'); }
+
+        function deleteSession(sid) {
+            if(!confirm("Purge selected session parameters?")) return;
+            db = db.filter(item => item.sessionId !== sid);
+            saveDatabase();
+        }
+
+        function deleteGroup(dayString) {
+            if(!confirm("Purge all " + activeViewProfile + " records from " + dayString + "?")) return;
+            db = db.filter(item => !(item.date === dayString && item.mode === activeViewProfile));
+            saveDatabase();
+        }
+
+        // ASYNCHRONOUS TARGETED BINARY PAYLOAD UPLOAD STREAM
+        function executeMobileOtaUpload() {
+            const fileSelector = document.getElementById('otaBinFile');
+            if(fileSelector.files.length === 0) return;
+            
+            if(!confirm("Initialize over-the-air firmware update process?")) return;
+            
+            systemLockedForUpdate = true;
+            document.getElementById('mTrigger').disabled = true;
+            document.getElementById('bMain').disabled = true;
+            document.getElementById('bSpec').disabled = true;
+            document.getElementById('otaSubmit').disabled = true;
+            document.getElementById('otaBinFile').disabled = true;
+            
+            const file = fileSelector.files[0];
+            const payloadForm = new FormData();
+            payloadForm.append('update', file);
+            
+            const ajaxPipe = new XMLHttpRequest();
+            
+            // SECURITY PATCH: Explicitly route structural sizing values to drop erasure latency thresholds
+            ajaxPipe.open('POST', '/update?size=' + file.size, true);
+            
+            const statusIndicator = document.getElementById('otaStatusBox');
+            statusIndicator.style.display = 'block';
+            statusIndicator.innerText = "Establishing secure flash pipeline...";
+            
+            ajaxPipe.upload.onprogress = function(event) {
+                if(event.lengthComputable) {
+                    let percentage = (event.loaded / event.total) * 100;
+                    statusIndicator.innerText = "FLASHING PAYLOAD: " + Math.round(percentage) + "% (KEEP PHONE NEARBY)";
+                }
+            };
+            
+            ajaxPipe.onload = function() {
+                if(ajaxPipe.status === 200) {
+                    statusIndicator.style.borderColor = "#00ffcc";
+                    statusIndicator.innerText = "SUCCESS! FIRMWARE COMMITTED. TARGET REBOOTING...";
+                } else {
+                    statusIndicator.style.borderColor = "#ff3b30";
+                    statusIndicator.style.color = "#ff3b30";
+                    statusIndicator.innerText = "FLASH REJECTED OR SOCKET DROPPED. RESET ENGINE AND RETRY.";
+                }
+            };
+            
+            ajaxPipe.onerror = function() {
+                statusIndicator.style.borderColor = "#ff3b30";
+                statusIndicator.style.color = "#ff3b30";
+                statusIndicator.innerText = "NETWORK PIPE CLOSED. CHECK TARGET WI-FI COUPLING.";
+            };
+            
+            ajaxPipe.send(payloadForm);
+        }
+
+        function pollServer() {
+            if (systemLockedForUpdate) return; 
+            
+            fetch('/status').then(res => res.json()).then(data => {
+                document.getElementById('batTag').innerText = "BAT: " + data.battery + "%";
+                let sLabel = data.state;
+                let btn = document.getElementById('mTrigger');
+                
+                if (data.laser === "MISALIGNED") {
+                    sLabel = "ALIGNMENT BLOCKED"; btn.disabled = true;
+                } else {
+                    btn.disabled = (data.state !== "IDLE" && data.state !== "FINISHED" && data.state !== "DISPLAY_SCORE");
+                }
+                document.getElementById('sysState').innerText = "System Status: " + sLabel;
+
+                if((data.state === "RUNNING" || data.state === "FINISHED" || data.state === "DISPLAY_SCORE") && data.time > 0 && data.runId > 0) {
+                    let compoundKey = data.runId + "_" + data.lapIndex;
+                    if(compoundKey !== lastProcessedLapKey) {
+                        lastProcessedLapKey = compoundKey;
+                        
+                        let targetSession = db.find(s => s.sessionId === data.runId);
+                        if(!targetSession) {
+                            targetSession = {
+                                sessionId: data.runId,
+                                date: getFormattedDate(),
+                                mode: data.mode === "MODE_MAIN" ? "Main" : "Special",
+                                laps: []
+                            };
+                            db.push(targetSession);
+                        }
+                        if(!targetSession.laps.some(l => l.lap === data.lapIndex)) {
+                            targetSession.laps.push({ lap: data.lapIndex, time: data.time });
+                            saveDatabase();
+                        }
+                    }
+                }
+            }).catch(() => {});
+        }
+
+        function drawLocalChart(laps) {
+            if(laps.length < 2) return '';
+            let times = laps.map(l => l.time);
+            let min = Math.min(...times), max = Math.max(...times);
+            let range = max - min || 1;
+            let w = 500, h = 60;
+            let pad = 10;
+            let step = (w - pad*2) / (laps.length - 1);
+            let pts = "";
+            laps.forEach((l, i) => {
+                let x = pad + (i * step);
+                let y = h - pad - (((l.time - min) / range) * (h - pad*2));
+                pts += `${x},${y} `;
+            });
+            return `<svg viewBox="0 0 ${w} ${h}" class="svg-box"><polyline fill="none" stroke="#00ffcc" stroke-width="2" points="${pts.trim()}"/></svg>`;
+        }
+
+        function processGlobalAveragesChart(filteredDb) {
+            const container = document.getElementById('globalChartContainer');
+            let uniqueDays = [...new Set(filteredDb.map(s => s.date))].sort();
+            if(uniqueDays.length < 2) {
+                container.innerHTML = `<div style="color:#444; font-size:10px; text-align:center; padding:15px 0;">Requires records across multiple days to render graphs</div>`;
+                return;
+            }
+            let dayAverages = [];
+            uniqueDays.forEach(day => {
+                let daySessions = filteredDb.filter(s => s.date === day);
+                let totalSum = 0, count = 0;
+                daySessions.forEach(s => s.laps.forEach(l => { totalSum += l.time; count++; }));
+                if(count > 0) dayAverages.push(totalSum / count);
+            });
+            let min = Math.min(...dayAverages), max = Math.max(...dayAverages);
+            let range = max - min || 1;
+            let w = 500, h = 80;
+            let pad = 15;
+            let step = (w - pad*2) / (dayAverages.length - 1);
+            let pts = "";
+            dayAverages.forEach((avg, i) => {
+                let x = pad + (i * step);
+                let y = h - pad - (((avg - min) / range) * (h - pad*2));
+                pts += `${x},${y} `;
+            });
+            container.innerHTML = `<svg viewBox="0 0 ${w} ${h}"><polyline fill="none" stroke="#ff9500" stroke-width="2.5" points="${pts.trim()}"/></svg>`;
+        }
+
+        function renderTree() {
+            const target = document.getElementById('dbRenderHook');
+            let filteredDb = db.filter(s => s.mode === activeViewProfile);
+            
+            if(filteredDb.length === 0) {
+                target.innerHTML = `<div style="color:#444; font-size:11px; text-align:center; padding:30px 0;">No logs in ${activeViewProfile} Profile</div>`;
+                document.getElementById('bestRecord').innerText = "--";
+                document.getElementById('sessionCount').innerText = "0";
+                document.getElementById('globalChartContainer').innerHTML = "";
+                return;
+            }
+
+            let allTimes = [];
+            filteredDb.forEach(s => s.laps.forEach(l => allTimes.push(l.time)));
+            document.getElementById('bestRecord').innerText = allTimes.length > 0 ? Math.min(...allTimes).toFixed(3) + "s" : "--";
+            document.getElementById('sessionCount').innerText = filteredDb.length;
+
+            let uniqueDays = [...new Set(filteredDb.map(s => s.date))].sort((a,b) => b.localeCompare(a));
+            let htmlStr = "";
+
+            uniqueDays.forEach(day => {
+                htmlStr += `<div class="group-header">
+                    <span class="group-title">DAY: ${day}</span>
+                    <button class="del-text" onclick="deleteGroup('${day}')">Wipe Day</button>
+                </div>`;
+                
+                let groupSessions = filteredDb.filter(s => s.date === day).sort((a,b) => b.sessionId - a.sessionId);
+                groupSessions.forEach((session) => {
+                    let totalTime = session.laps.reduce((acc, curr) => acc + curr.time, 0);
+                    let avgTime = session.laps.length ? (totalTime / session.laps.length) : 0;
+                    let sessionLow = Math.min(...session.laps.map(l => l.time));
+                    
+                    htmlStr += `<div class="session-box">
+                        <div class="session-meta">
+                            <span>SESSION ID UNIT #${session.sessionId}</span>
+                            <button class="del-text" onclick="deleteSession(${session.sessionId})">Delete</button>
+                        </div>
+                        <div style="font-size:10px; color:#aaa; margin:5px 0 2px 0;">
+                            Splits: <span class="highlight">${session.laps.length}</span> | 
+                            Avg: <span class="highlight">${avgTime.toFixed(3)}s</span> | 
+                            Best: <span style="color:#ff9500; font-weight:bold;">${sessionLow.toFixed(3)}s</span>
+                        </div>
+                        ${drawLocalChart(session.laps)}
+                        <table>
+                            <thead><tr><th>Lap Index</th><th>Split Time</th><th>Accumulated Delta</th></tr></thead>
+                            <tbody>`;
+                    
+                    let cumulativeDelta = 0;
+                    session.laps.forEach(l => {
+                        cumulativeDelta += l.time;
+                        htmlStr += `<tr>
+                            <td>Lap ${l.lap}</td>
+                            <td class="highlight">${l.time.toFixed(3)}s</td>
+                            <td style="color:#666;">${cumulativeDelta.toFixed(3)}s</td>
+                        </tr>`;
+                    });
+                    htmlStr += `</tbody></table></div>`;
+                });
+            });
+
+            target.innerHTML = htmlStr;
+            processGlobalAveragesChart(filteredDb);
+        }
+
+        loadDatabase();
+        setInterval(pollServer, 350);
+    </script>
+</body>
+</html>
+)rawliteral";
+
+const char WATCH_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Watch Trigger</title>
+    <style>
+        body, html { margin:0; padding:0; background:#000; width:100%; height:100%; overflow:hidden; font-family:sans-serif; }
+        .watch-container { width:100vw; height:100vh; display:flex; flex-direction:column; justify-content:center; align-items:center; }
+        .trigger-target { width:88vw; height:88vw; max-width:160px; max-height:160px; border-radius:50%; background:#00ffcc; border:none; color:#000; font-weight:bold; font-size:20px; text-transform:uppercase; cursor:pointer; }
+        .trigger-target:active { background:#ff9500; transform: scale(0.95); }
+        .status-text { font-size:11px; margin-top:10px; color:#888; text-transform:uppercase; font-weight:bold;}
+    </style>
+</head>
+<body>
+    <div class="watch-container">
+        <button class="trigger-target" onclick="fireWatchTrigger()">ARM</button>
+        <div id="wState" class="status-text">TAP TO RUN</div>
+    </div>
+    <script>
+        function fireWatchTrigger() {
+            document.getElementById('wState').innerText = "ARMING...";
+            fetch('/arm')
+                .then(res => res.text())
+                .then(txt => {
+                    document.getElementById('wState').innerText = txt;
+                    setTimeout(() => { document.getElementById('wState').innerText = "MONITORING"; }, 1200);
+                }).catch(() => {
+                    document.getElementById('wState').innerText = "NET FAULT";
+                });
+        }
+    </script>
+</body>
+</html>
+)rawliteral";
+
+// ==========================================
+// ASYNCHRONOUS WEB ENDPOINT ROUTING HOOKS
+// ==========================================
+void handleRoot() { server.send(200, "text/html", HTML_PAGE); }
+void handleWatchView() { server.send(200, "text/html", WATCH_PAGE); }
+
+void handleArmCommand() {
+    lastSystemActivityMillis = millis();
+    if (currentState == OTA_UPDATE) {
+        server.send(200, "text/plain", "SYSTEM_FLASH_LOCK");
+        return;
+    }
+    
+    if (currentState == IDLE || currentState == DISPLAY_SCORE || currentState == FINISHED) {
+        if (!isLaserAligned()) {
+            server.send(200, "text/plain", "FAULT_MISALIGNED");
+            return;
+        }
+        
+        if (activeMode == MODE_SPECIAL) {
+            server.send(200, "text/plain", "COUNTDOWN_STARTED");
+            startSpecialModeWithCountdown(); 
+        } else {
+            currentState = ARM_WAIT_START;
+            laserWasAlignedSinceArming = false; 
+            currentLapSequenceNumber = 0;
+            server.send(200, "text/plain", "ARMED_READY");
+        }
+    } else {
+        server.send(200, "text/plain", "SYSTEM_BUSY");
+    }
+}
+
+void handleSetModeCommand() {
+    lastSystemActivityMillis = millis();
+    if (currentState == OTA_UPDATE) return;
+    String target = server.arg("mode");
+    activeMode = (target == "special") ? MODE_SPECIAL : MODE_MAIN;
+    currentState = IDLE;
+    server.send(200, "text/plain", "MODE_CHANGED");
+}
+
+void handleStatus() {
+    String stateStr = "IDLE";
+    if (currentState == ARM_WAIT_START) stateStr = "READY_ARMED";
+    else if (currentState == RUNNING) stateStr = "RUNNING";
+    else if (currentState == FINISHED || currentState == DISPLAY_SCORE) stateStr = "FINISHED";
+    else if (currentState == OTA_UPDATE) stateStr = "FLASHING_OTA";
+
+    String modeStr = (activeMode == MODE_MAIN) ? "MODE_MAIN" : "MODE_SPECIAL";
+    String laserStr = isLaserAligned() ? "ALIGNED" : "MISALIGNED";
+    
+    String json = "{\"state\":\"" + stateStr + "\",\"mode\":\"" + modeStr + "\",\"laser\":\"" + laserStr + 
+                  "\",\"time\":" + String(finalTimeSeconds, 3) + ",\"lapIndex\":" + String(currentLapSequenceNumber) + 
+                  ",\"battery\":" + String(getBatteryPercentage()) + ",\"runId\":" + String(runIdCounter) + "}";
+    server.send(200, "application/json", json);
+}
+
+// ==========================================
+// PHYSICAL TOUCH EMBEDDED CONTROL TREE
+// ==========================================
+void executeButtonCommand(int actionType) {
+    if (currentState == OTA_UPDATE) return; 
+    lastSystemActivityMillis = millis(); 
+
+    if (actionType == 6) { 
+        if (isWifiActive) turnWifiOff(); else turnWifiOn();
+        triggerSimpleBeep(1800, 100); delay(50); triggerSimpleBeep(1800, 100);
+        if (currentState == INFO_SCREEN) showInfoScreen();
+        else if (currentState == IDLE) {
+            if(isLaserAligned()) showStandbyScreen(); else showLaserAlignmentWarning();
+        }
+        return;
+    }
+
+    if (currentState == IDLE && actionType == 2) { 
+        activeMode = (activeMode == MODE_SPECIAL) ? MODE_MAIN : MODE_SPECIAL;
+        triggerSimpleBeep(1500, 100);
+        if(isLaserAligned()) showStandbyScreen(); else showLaserAlignmentWarning();
+        return;
+    }
+
+    if (currentState == RUNNING && actionType == 1) { 
+        currentState = FINISHED;
+        return;
+    }
+
+    if (currentState == DISPLAY_SCORE || currentState == FINISHED || currentState == INFO_SCREEN) {
+        if (actionType == 1) { 
+            finalTimeSeconds = 0.0; 
+            currentState = IDLE;
+            currentLapSequenceNumber = 0;
+            digitalWrite(GREEN_LED_PIN, LOW); 
+            digitalWrite(RED_LED_PIN, LOW);
+            if(isLaserAligned()) showStandbyScreen(); else showLaserAlignmentWarning();
+        }
+        return; 
+    }
+
+    if (actionType == 3) { 
+        if (currentState == IDLE) {
+            if (!isLaserAligned()) {
+                triggerSimpleBeep(600, 300);
+                showLaserAlignmentWarning();
+                return;
+            }
+            
+            if (activeMode == MODE_SPECIAL) {
+                startSpecialModeWithCountdown();
+            } else {
+                currentState = ARM_WAIT_START;
+                laserWasAlignedSinceArming = false; 
+                currentLapSequenceNumber = 0;
+                triggerSimpleBeep(2000, 250);
+                showStandbyScreen();
+            }
+        }
+    } 
+    else if (actionType == 4) { 
+        if (currentState == IDLE) {
+            currentState = INFO_SCREEN;
+            showInfoScreen();
+        }
+    }
+}
+
+void checkStartButtonEvents() {
+    int reading = digitalRead(START_BUTTON_PIN);
+    static int lastReading = LOW; 
+    static unsigned long pressedTime = 0;
+    static unsigned long releasedTime = 0;
+    static bool isPressing = false;
+    static bool longPressedActive = false;
+    static int clickCounter = 0;
+
+    if (reading == HIGH && lastReading == LOW) { 
+        pressedTime = millis();
+        isPressing = true;
+        longPressedActive = false;
+    }
+    
+    if (reading == HIGH && isPressing) {
+        if (!longPressedActive && (millis() - pressedTime > 2000)) { 
+            longPressedActive = true;
+            isPressing = false;
+            clickCounter = 0;
+            executeButtonCommand(3); 
+        }
+    }
+
+    if (reading == LOW && lastReading == HIGH) { 
+        if (!longPressedActive) {
+            clickCounter++;
+            releasedTime = millis();
+        }
+        isPressing = false;
+    }
+
+    if (reading == LOW && clickCounter > 0 && (millis() - releasedTime > 280)) {
+        if (clickCounter == 1) executeButtonCommand(1);      
+        else if (clickCounter == 2) executeButtonCommand(2); 
+        else if (clickCounter == 3) executeButtonCommand(4); 
+        else if (clickCounter == 6) executeButtonCommand(6); 
+        clickCounter = 0;
+    }
+    lastReading = reading;
+}
+
+// ==========================================
+// ENVIRONMENT INIT EXECUTION POINT
+// ==========================================
+void setup() {
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+    WiFi.mode(WIFI_OFF); 
+    
+    pinMode(START_BUTTON_PIN, INPUT); 
+    pinMode(LASER_SENSOR_PIN, INPUT_PULLUP);
+    analogSetAttenuation(ADC_11db);
+    
+    pinMode(RED_LED_PIN, OUTPUT);
+    pinMode(GREEN_LED_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT); 
+    
+    digitalWrite(RED_LED_PIN, LOW);
+    digitalWrite(GREEN_LED_PIN, LOW);
+    digitalWrite(BUZZER_PIN, LOW);
+
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        while(true) { 
+            digitalWrite(RED_LED_PIN, HIGH); delay(100);
+            digitalWrite(RED_LED_PIN, LOW); delay(100);
+        }
+    }
+
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+    display.setCursor(16, 28);
+    display.println("SYSTEM REBOOT");
+    display.display();
+    
+    triggerSimpleBeep(1500, 200);
+    delay(200);
+    
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/watch", HTTP_GET, handleWatchView); 
+    server.on("/arm", HTTP_GET, handleArmCommand);
+    server.on("/status", HTTP_GET, handleStatus);
+    server.on("/setMode", HTTP_GET, handleSetModeCommand);
+    
+    // ====================================================
+    // HIGH-STABILITY MULTI-PART PHONE UPLOAD HANDLING BLOCK
+    // ====================================================
+    server.on("/update", HTTP_POST, []() {
+        server.sendHeader("Connection", "close");
+        server.send(200, "text/plain", (Update.hasError()) ? "OTA_ERROR" : "OTA_SUCCESS_REBOOTING");
+        delay(1000);
+        ESP.restart();
+    }, []() {
+        HTTPUpload& upload = server.upload();
+        if (upload.status == UPLOAD_FILE_START) {
+            currentState = OTA_UPDATE;
+            digitalWrite(RED_LED_PIN, HIGH);
+            digitalWrite(GREEN_LED_PIN, HIGH);
+            
+            display.clearDisplay();
+            display.setTextSize(1); display.setCursor(4, 4);
+            display.println("FIRMWARE UPDATE");
+            display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+            display.setCursor(4, 28);
+            display.println("PHONE STREAM ACTIVE");
+            display.setCursor(4, 45);
+            display.println("Flashing Core...");
+            display.display();
+            
+            // Read exact byte allocation sent by mobile JS client
+            size_t absoluteBinarySize = UPDATE_SIZE_UNKNOWN;
+            if (server.hasArg("size")) {
+                absoluteBinarySize = server.arg("size").toInt();
+            }
+            
+            if (!Update.begin(absoluteBinarySize)) {
+                Update.printError(Serial);
+            }
+        } else if (upload.status == UPLOAD_FILE_WRITE) {
+            if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+                Update.printError(Serial);
+            }
+            
+            // ─── THE ANTI-DISCONNECT FIX ───
+            // Feed the RTOS watchdogs and let the TCP stack transmit ACK packets back to the phone
+            yield();
+            delay(2); 
+            
+        } else if (upload.status == UPLOAD_FILE_END) {
+            if (Update.end(true)) {
+                display.clearDisplay();
+                display.setCursor(4, 20);
+                display.println("PAYLOAD LOCKED");
+                display.setCursor(4, 40);
+                display.println("BOOTING TARGET...");
+                display.display();
+                triggerSimpleBeep(2500, 350);
+            }
+        }
+    });
+    
+    turnWifiOn();
+    lastSystemActivityMillis = millis();
+    
+    if(isLaserAligned()) showStandbyScreen(); else showLaserAlignmentWarning();
+}
+
+// ==========================================
+// CYCLIC REAL-TIME CORE MONITOR ENGINE
+// ==========================================
+void loop() {
+    if (isWifiActive) {
+        server.handleClient();
+    }
+    
+    if (currentState == OTA_UPDATE) return; 
+    
+    checkStartButtonEvents();
+    unsigned long currentMillis = millis();
+
+    if (currentState == IDLE && (currentMillis - lastSystemActivityMillis >= INACTIVITY_TIMEOUT_MILLIS)) {
+        executeSystemSleep();
+        return; 
+    }
+
+    if (currentState == IDLE || currentState == ARM_WAIT_START) {
+        if (!isLaserAligned()) { 
+            if (currentMillis - ledBlinkTimerMillis >= 300) {
+                ledBlinkTimerMillis = currentMillis;
+                digitalWrite(RED_LED_PIN, !digitalRead(RED_LED_PIN));
+            }
+            digitalWrite(GREEN_LED_PIN, LOW);
+            if (currentMillis - menuRefreshTimerMillis >= 1000) {
+                menuRefreshTimerMillis = currentMillis;
+                showLaserAlignmentWarning();
+            }
+        } 
+        else {
+            digitalWrite(RED_LED_PIN, LOW);
+            digitalWrite(GREEN_LED_PIN, currentState == ARM_WAIT_START ? !digitalRead(GREEN_LED_PIN) : HIGH);
+            if (currentMillis - menuRefreshTimerMillis >= 1000) {
+                menuRefreshTimerMillis = currentMillis;
+                showStandbyScreen();
+            }
+        }
+    }
+
+    if (currentState == ARM_WAIT_START && activeMode == MODE_MAIN) {
+        if (isLaserAligned()) {
+            laserWasAlignedSinceArming = true;
+        }
+        
+        if (!isLaserAligned()) {
+            if (laserWasAlignedSinceArming) {
+                lastSystemActivityMillis = currentMillis;
+                startTimeMicros = micros();
+                lastPassMicros = startTimeMicros;
+                currentState = RUNNING;
+                currentLapSequenceNumber = 1;
+                runIdCounter++; 
+                
+                digitalWrite(RED_LED_PIN, HIGH);
+                digitalWrite(GREEN_LED_PIN, LOW);
+                triggerSimpleBeep(1000, 80);
+                
+                display.clearDisplay();
+                display.setTextSize(1); display.setCursor(4,4); display.print("TRACK ACTIVE");
+                display.setCursor(4, 24); display.print("LAP 1 IN PROGRESS...");
+                display.display();
+                
+                delayMicroseconds(PASS_LOCKOUT_MICROS); 
+            } else {
+                currentState = IDLE;
+                triggerSimpleBeep(700, 300); 
+                showLaserAlignmentWarning();
+            }
+        }
+    }
+
+    if (currentState == RUNNING && !isLaserAligned()) {
+        unsigned long currentMicros = micros();
+        
+        if (activeMode == MODE_SPECIAL && (currentMicros - startTimeMicros < SPECIAL_DEADZONE_MICROS)) {
+            // Ignition protection blanking window loop
+        } 
+        else if (currentMicros - lastPassMicros >= PASS_LOCKOUT_MICROS) {
+            lastSystemActivityMillis = currentMillis;
+            finalTimeSeconds = (currentMicros - lastPassMicros) / 1000000.0;
+            lastPassMicros = currentMicros;
+            
+            triggerSimpleBeep(1500, 80);
+            
+            display.clearDisplay();
+            display.setTextSize(1); display.setCursor(4,4); display.print("SPLIT LOGGED");
+            display.setCursor(4, 24);
+            display.print("LAP "); display.print(currentLapSequenceNumber); display.print(": "); display.print(finalTimeSeconds, 3); display.print("s");
+            display.display();
+            
+            currentLapSequenceNumber++;
+            delayMicroseconds(PASS_LOCKOUT_MICROS);
+        }
+    }
+
+    if (currentState == FINISHED) {
+        lastSystemActivityMillis = currentMillis;
+        
+        display.clearDisplay();
+        display.setTextSize(1); display.setCursor(4, 15); display.println("RUN COMPLETE");
+        display.setCursor(4, 35); 
+        display.print("TOTAL LAPS: "); display.print(currentLapSequenceNumber - 1);
+        display.display();
+
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(RED_LED_PIN, HIGH); digitalWrite(GREEN_LED_PIN, HIGH);
+            triggerSimpleBeep(1600, 60); delay(40);             
+            digitalWrite(RED_LED_PIN, LOW); digitalWrite(GREEN_LED_PIN, LOW);
+            delay(40);              
+        }
+        digitalWrite(GREEN_LED_PIN, HIGH); 
+        currentState = DISPLAY_SCORE;
+    }
+}
