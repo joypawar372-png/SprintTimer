@@ -58,3 +58,9 @@ This project transforms a standard microcontroller into an automated, high-preci
 1. **Flash the Core:** Open `SprintTimer.ino` inside the Arduino IDE, install the required `Adafruit SSD1306` library dependencies, and upload the code to your ESP32.
 2. **Connect to the Network:** Turn on your hardware module, open your phone's Wi-Fi settings, and connect to the password-free **SprintTimer** hotspot network.
 3. **Open the Dashboard:** Launch any mobile web browser and navigate to `http://192.168.4.1` to access your local live telemetry control panel.
+<img width="458" height="504" alt="Screenshot 2026-07-11 215000" src="https://github.com/user-attachments/assets/c0d644e0-a07a-48a5-999b-a4ed13cb136f" />
+<img width="482" height="401" alt="Screenshot 2026-07-11 215123" src="https://github.com/user-attachments/assets/033428da-e4b9-4058-839c-deacd521b433" />
+<img width="484" height="684" alt="Screenshot 2026-07-11 215030" src="https://github.com/user-attachments/assets/a17ba496-8cac-466c-8a45-425c16e2aa59" />
+<img width="246" height="200" alt="image" src="https://github.com/user-attachments/assets/457e1095-969e-479e-9f46-db9a55376be9" />
+
+
