@@ -64,3 +64,13 @@ This project transforms a standard microcontroller into an automated, high-preci
 <img width="246" height="200" alt="image" src="https://github.com/user-attachments/assets/457e1095-969e-479e-9f46-db9a55376be9" />
 
 
+## 🔮 Future Development & Sensor Evolution
+
+While the initial build leveraged a laser-based trigger system, I am currently transitioning the core sensing mechanism to ultrasonic sonar to resolve ongoing alignment frustrations and improve real-world usability in outdoor environments.
+
+### Roadmap for Sensor Upgrades:
+* **Refining Sonar Precision:** Developing software-side signal filtering to compensate for the "detection cone" and minimize latency caused by the speed of sound.
+* **Transitioning to ToF (Time-of-Flight):** My long-term plan is to migrate from basic sonar to high-precision Laser Time-of-Flight sensors (like the VL53L1X). This will provide the accuracy of a light-based system without the headache of manual, sub-millimeter receiver alignment.
+* **Environmental Hardening:** Engineering a modular, weather-resistant housing for the JSN-SR04T waterproof sonar probe to allow for permanent outdoor track installations.
+* **Multi-Gate Synchronization:** Implementing an ESP-NOW mesh network so multiple gate modules can communicate wirelessly, allowing for complex multi-split timing across an entire agility course.
+
